@@ -83,6 +83,10 @@ verify_*.py
 !.claude/skills/
 !.claude/skills/**
 
+# 回测生成的结果文件（本地分析产物，非源码）
+/backtest_results.csv
+/backtest_llm_results.csv
+
 # ignore static files
 static/
 /apps/dsa-desktop/dist/
