@@ -29,6 +29,68 @@ def _fetch_trend_data(stock_code: str):
     return df
 
 
+# Trading days in a 52-week window (~1 calendar year).
+_LONG_HORIZON_WINDOW = 252
+# Fetch a bit more than the window so MA200 has full lookback.
+_LONG_HORIZON_FETCH_DAYS = 260
+
+
+def _compute_long_horizon_context(stock_code: str) -> dict:
+    """Compute long-period regime context: MA200 and 52-week high/low position.
+
+    Reads a ~260-day window (already prefetched into the DB by
+    ``_ensure_agent_history``) and derives the long-term trend regime that the
+    short (60-day) trend analysis cannot see. Degrades gracefully when a stock
+    has insufficient history (e.g. a recent listing): fields become ``None`` and
+    ``partial`` flags the shortfall instead of raising.
+    """
+    from src.services.history_loader import load_history_df
+
+    df, _ = load_history_df(stock_code, days=_LONG_HORIZON_FETCH_DAYS)
+    if df is None or df.empty:
+        return {"available": False, "reason": "no_history"}
+
+    close = df["close"]
+    high = df["high"] if "high" in df.columns else close
+    low = df["low"] if "low" in df.columns else close
+    bars = len(close)
+    price = float(close.iloc[-1])
+
+    context: dict = {"available": True, "bars_available": bars}
+
+    # --- MA200 (long-term trend regime) ---
+    if bars >= 200:
+        ma200 = float(close.rolling(window=200).mean().iloc[-1])
+        context["ma200"] = round(ma200, 2)
+        context["price_above_ma200"] = price > ma200
+        context["bias_ma200_pct"] = round((price - ma200) / ma200 * 100, 2) if ma200 else None
+        context["long_term_regime"] = "多头(价格在年线上方)" if price > ma200 else "空头(价格在年线下方)"
+    else:
+        context["ma200"] = None
+        context["price_above_ma200"] = None
+        context["bias_ma200_pct"] = None
+        context["long_term_regime"] = f"数据不足(仅{bars}根K线,无法计算年线)"
+
+    # --- 52-week high / low position ---
+    window = df.tail(_LONG_HORIZON_WINDOW)
+    w_high = float(window["high"].max()) if "high" in window.columns else float(window["close"].max())
+    w_low = float(window["low"].min()) if "low" in window.columns else float(window["close"].min())
+    context["week52_high"] = round(w_high, 2)
+    context["week52_low"] = round(w_low, 2)
+    context["pct_from_52w_high"] = round((price / w_high - 1) * 100, 2) if w_high else None
+    context["pct_from_52w_low"] = round((price / w_low - 1) * 100, 2) if w_low else None
+    # Position in range: 0% = at 52w low, 100% = at 52w high.
+    span = w_high - w_low
+    context["range_position_pct"] = round((price - w_low) / span * 100, 1) if span > 0 else None
+
+    # Flag if the 52-week window is not actually a full year of data.
+    context["partial"] = bars < _LONG_HORIZON_WINDOW
+    if context["partial"]:
+        context["partial_note"] = f"仅{bars}个交易日,52周区间基于可用数据估算"
+
+    return context
+
+
 def _handle_analyze_trend(stock_code: str) -> dict:
     """Run technical trend analysis on a stock."""
     from src.stock_analyzer import StockTrendAnalyzer
@@ -50,6 +112,14 @@ def _handle_analyze_trend(stock_code: str) -> dict:
         logger.warning("analyze_trend(%s): Trend analysis failed", stock_code, exc_info=True)
         return {"error": f"Trend analysis failed for {stock_code}"}
 
+    # Long-period regime context (MA200 + 52-week position) that the 60-day
+    # short-term analysis above cannot capture. Never let this fail the tool.
+    try:
+        long_horizon = _compute_long_horizon_context(stock_code)
+    except Exception:
+        logger.warning("analyze_trend(%s): long-horizon context failed", stock_code, exc_info=True)
+        long_horizon = {"available": False, "reason": "compute_error"}
+
     return {
         "code": result.code,
         "trend_status": result.trend_status.value,
@@ -59,6 +129,7 @@ def _handle_analyze_trend(stock_code: str) -> dict:
         "ma10": result.ma10,
         "ma20": result.ma20,
         "ma60": result.ma60,
+        "long_horizon": long_horizon,
         "current_price": result.current_price,
         "bias_ma5": round(result.bias_ma5, 2),
         "bias_ma10": round(result.bias_ma10, 2),
@@ -93,7 +164,10 @@ analyze_trend_tool = ToolDefinition(
                 "Fetches historical data from database or data source. "
                 "Returns MA alignment, bias rates, MACD status, RSI levels, "
                 "volume analysis, support/resistance levels, and a buy/sell signal "
-                "with a score (0-100).",
+                "with a score (0-100). Also returns a 'long_horizon' block with "
+                "MA200 (long-term regime: price above/below the yearly line) and "
+                "52-week high/low position — use this to avoid buying into a "
+                "long-term downtrend or chasing near 52-week highs.",
     parameters=[
         ToolParameter(
             name="stock_code",
